@@ -4,18 +4,30 @@ from graphql import GraphQLError
 import pytz
 from dateutil import parser
 from datetime import timedelta
+from graphene import String
 
 from api.events.models import Events as EventsModel
 from api.room.models import Room as RoomModel
+from api.events.models import (
+    filter_event
+)
 from helpers.calendar.events import RoomSchedules, CalendarEvents
 from helpers.email.email import notification
-from helpers.calendar.credentials import get_single_calendar_event
+from helpers.calendar.credentials import (
+    get_single_calendar_event,
+    credentials
+)
 from helpers.auth.authentication import Auth
 from helpers.pagination.paginate import ListPaginate
-from helpers.devices.devices import update_device_last_seen
+from helpers.devices.devices import update_device_last_activity
 from helpers.events_filter.events_filter import (
-    filter_events_by_date_range,
-    validate_page_and_per_page
+    sort_events_by_date,
+    validate_page_and_per_page,
+    validate_calendar_id_input
+)
+from helpers.events_filter.events_filter import (
+    calendar_dates_format,
+    empty_string_checker
 )
 
 utc = pytz.utc
@@ -27,6 +39,87 @@ class Events(SQLAlchemyObjectType):
     """
     class Meta:
         model = EventsModel
+
+
+class BookEvent(graphene.Mutation):
+    """
+        Book Calendar events
+    """
+    response = graphene.String()
+
+    class Arguments:
+        event_title = graphene.String(required=True)
+        start_date = graphene.String(required=True)
+        start_time = graphene.String(required=True)
+        duration = graphene.Float(required=False)
+        attendees = graphene.String(required=False)
+        organizer = graphene.String(required=False)
+        description = graphene.String(required=False)
+        room = graphene.String(required=True)
+        time_zone = graphene.String(required=True)
+
+    @Auth.user_roles('Admin', 'Default User', 'Super Admin')
+    def mutate(self, info, **kwargs):
+        """Creates calendar events
+
+        Args:
+            event_title: A sting that communicates the event summary/title
+            [required]
+            start_date: The start date of the event eg. 'Nov 4 2019' [required]
+            start_time: The end time of the event eg '07:00 AM' [required]
+            duration: A float of the duration of the event in minutes
+            attendees: A string of emails of the event guests
+            description: Any additional information about the event
+            room: The meeting room where the even will be held [required]
+            time_zone: The timezone of the event location eg. 'Africa/Kigali'
+            organizer: The email of the co-organizer, the converge email is
+            the default
+
+        Returns:
+            A string that communicates a successfully created event.
+        """
+        room = kwargs.get('room', None)
+        attendees = kwargs.get('attendees', None)
+        description = kwargs.get('description', None)
+        time_zone = kwargs.get('time_zone', 'Africa/Accra')
+        duration = kwargs.get('duration', 60)
+        organizer = kwargs.get('organizer', None)
+
+        event_title = kwargs['event_title']
+        empty_string_checker(event_title)
+        empty_string_checker(room)
+        empty_string_checker(time_zone)
+
+        start_date, end_date = calendar_dates_format(
+            kwargs['start_date'], kwargs['start_time'], duration)
+
+        attendees = attendees.replace(" ", "").split(",")
+        guests = []
+        for guest in attendees:
+            attendee = {'email': guest}
+            guests.append(attendee)
+
+        event = {
+            'summary': kwargs['event_title'],
+            'location': room,
+            'description': description,
+            'start': {
+                'dateTime': start_date,
+                'timeZone': time_zone,
+            },
+            'end': {
+                'dateTime': end_date,
+                'timeZone': time_zone,
+            },
+            'attendees': guests,
+            "organizer": {
+                "email": organizer
+            }
+        }
+        service = credentials.set_api_credentials()
+        service.events().insert(calendarId='primary', body=event,
+                                sendNotifications=True).execute()
+        return BookEvent(response='Event created successfully')
 
 
 class EventCheckin(graphene.Mutation):
@@ -46,7 +139,8 @@ class EventCheckin(graphene.Mutation):
     def mutate(self, info, **kwargs):
         room_id, event = check_event_in_db(self, info, "checked_in", **kwargs)
         if kwargs.get('check_in_time'):
-            update_device_last_seen(info, room_id, kwargs['check_in_time'])
+            update_device_last_activity(
+                info, room_id, kwargs['check_in_time'], 'check in')
         if not event:
             event = EventsModel(
                 event_id=kwargs['event_id'],
@@ -79,10 +173,11 @@ class CancelEvent(graphene.Mutation):
         room_id, event = check_event_in_db(self, info, "cancelled", **kwargs)
         try:
             device_last_seen = parser.parse(
-                    kwargs['start_time']) + timedelta(minutes=10)
+                kwargs['start_time']) + timedelta(minutes=10)
         except ValueError:
             raise GraphQLError("Invalid start time")
-        update_device_last_seen(info, room_id, device_last_seen)
+        update_device_last_activity(
+            info, room_id, device_last_seen, 'cancel meeting')
         if not event:
             event = EventsModel(
                 event_id=kwargs['event_id'],
@@ -96,15 +191,15 @@ class CancelEvent(graphene.Mutation):
                 auto_cancelled=True)
             event.save()
         calendar_event = get_single_calendar_event(
-                                                    kwargs['calendar_id'],
-                                                    kwargs['event_id']
-                                                )
+            kwargs['calendar_id'],
+            kwargs['event_id']
+        )
         event_reject_reason = 'after 10 minutes'
         if not notification.event_cancellation_notification(
-                                                            calendar_event,
-                                                            room_id,
-                                                            event_reject_reason
-                                                            ):
+            calendar_event,
+            room_id,
+            event_reject_reason
+        ):
             raise GraphQLError("Event cancelled but email not sent")
         return CancelEvent(event=event)
 
@@ -124,11 +219,14 @@ class EndEvent(graphene.Mutation):
 
     def mutate(self, info, **kwargs):
         room_id, event = check_event_in_db(self, info, "ended", **kwargs)
+        if kwargs.get('meeting_end_time'):
+            update_device_last_activity(
+                info, room_id, kwargs['meeting_end_time'], 'end meeting')
         if not event:
             event = EventsModel(
                 event_id=kwargs['event_id'],
                 meeting_end_time=kwargs['meeting_end_time']
-                )
+            )
             event.save()
 
         return EndEvent(event=event)
@@ -193,6 +291,19 @@ def check_event_in_db(instance, info, event_check, **kwargs):
 class Mutation(graphene.ObjectType):
     event_checkin = EventCheckin.Field()
     cancel_event = CancelEvent.Field()
+    book_event = BookEvent.Field(
+        description="Mutation to book a calendar event given the arguments\
+            \n- event_title: A sting that communicates the event\
+            summary/title [required]\n- start_date: The start date \
+                 of the event eg 'Nov 4 2019' [required]\
+            \n- start_time: The end time of the event eg'07:00 AM'[required]\
+            \n- duration: A float of the duration of the event in minutes\
+            \n- attendees: A string of emails of the event guests\
+            \n- description: Any additional information about the event\
+            \n- room: The meeting room where the even will be held[required]\
+            \n- organizer: The email of the co - organizer, the converge\
+                email is the default\
+            \n- time_zone: The timezone of the event location")
     end_event = EndEvent.Field(
         description="Mutation to end a calendar event given the arguments\
             \n- calendar_id: The unique identifier of the calendar event\
@@ -236,6 +347,13 @@ class PaginateEvents(graphene.ObjectType):
     has_previous = graphene.Boolean()
 
 
+class RoomEvents(graphene.ObjectType):
+    """
+        Return all events in a room
+    """
+    events = graphene.List(Events)
+
+
 class Query(graphene.ObjectType):
     all_events = graphene.Field(
         PaginateEvents,
@@ -249,7 +367,19 @@ class Query(graphene.ObjectType):
             \n- end_date: The date and time to end selection in range \
                             when filtering by the time period\
             \n- page: Page number to select when paginating\
-            \n- per_page: The maximum number of events per page when paginating") # noqa
+            \n- per_page: The maximum number of events per page when paginating")  # noqa
+
+    all_events_by_room = graphene.Field(
+        RoomEvents,
+        calendar_id=String(),
+        start_date=String(),
+        end_date=String(),
+        description="Query that returns a list of events given the arguments\
+            \n- calendar_id: The room calendar Id\
+            \n- start_date: The date and time to start selection in range \
+                            when filtering by the time period\
+            \n- end_date: The date and time to end selection in range \
+                            when filtering by the time period")
 
     @Auth.user_roles('Admin', 'Default User', 'Super Admin')
     def resolve_all_events(self, info, **kwargs):
@@ -258,13 +388,10 @@ class Query(graphene.ObjectType):
         page = kwargs.get('page')
         per_page = kwargs.get('per_page')
         page, per_page = validate_page_and_per_page(page, per_page)
-        query = Events.get_query(info)
-        response = filter_events_by_date_range(
-            query, start_date, end_date
-            )
-        response.sort(
-            key=lambda x: parser.parse(x.start_time).astimezone(utc),
-            reverse=True)
+        response = filter_event(
+           start_date, end_date
+        )
+        sort_events_by_date(response)
 
         if page and per_page:
             paginated_response = ListPaginate(
@@ -284,3 +411,21 @@ class Query(graphene.ObjectType):
                 pages=pages)
 
         return PaginateEvents(events=response)
+
+    @Auth.user_roles('Admin', 'Super Admin')
+    def resolve_all_events_by_room(self, info, **kwargs):
+        calendar_id = kwargs.get('calendar_id')
+        validate_calendar_id_input(calendar_id)
+        start_date = kwargs.get('start_date')
+        end_date = kwargs.get('end_date')
+        room = RoomModel.query.filter_by(
+            calendar_id=calendar_id
+        ).first()
+        if not room:
+            raise GraphQLError("No rooms with the given CalendarId")
+        response = filter_event(
+            start_date, end_date, room.id
+        )
+        sort_events_by_date(response)
+
+        return RoomEvents(events=response)
